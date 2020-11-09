@@ -4,7 +4,7 @@ A streamlit app to help schedule shifts
 # Installation
 
 ## Local Install
-Install the required environment locally using (poetry)[https://python-poetry.org/]
+Install the required environment locally using [poetry](https://python-poetry.org/)
 ```
 poetry install
 ```
@@ -14,7 +14,7 @@ Then start a shell in the local environment
 poetry shell
 ```
 
-Then start the app with (streamlit)[https://www.streamlit.io/]
+Then start the app with [streamlit](https://www.streamlit.io/)
 ```
 streamlit run app/scheduling_app.py
 ```
