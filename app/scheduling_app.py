@@ -95,6 +95,7 @@ PREFERENCE_TO_SCORE: Dict[int, int] = {
     19: -8,
     20: -9,
     21: -10,
+    0: -1000,
 }
 
 # =======================================================================#
@@ -305,6 +306,9 @@ def create_demand_heatmap(roster: pd.DataFrame) -> go.Figure:
         roster_formatted_for_heatmap.loc[
             :, col
         ] = roster_formatted_for_heatmap.loc[:, col].apply(int)
+    roster_formatted_for_heatmap = roster_formatted_for_heatmap.applymap(
+        lambda value: 21 if value == 0 else value
+    )
     roster_formatted_for_heatmap[
         "Average_Preference"
     ] = roster_formatted_for_heatmap.mean(axis=1)
@@ -408,6 +412,12 @@ def compute_optimal_schedule(
                 <= 1
             )
 
+    # A person might not be able to work all possible shifts
+    for employee in all_employees:
+        for shift in all_shifts:
+            if all_employees[employee].preferences[shift] <= -100:
+                model.Add(sum([shifts[(employee, shift)]]) < 1)
+
     # Workaround for minimizing variance of scores
     # Instead, minimize difference between max score and min score
     # From: https://stackoverflow.com/a/53363585
@@ -470,6 +480,8 @@ def compute_optimal_schedule(
 
     solver = CpSolver()
     solver.Solve(model)
+    st.write(solver.StatusName())
+    st.write(solver.ResponseStats())
 
     # Prepare results
     shifts_per_employee: Dict[int, int] = {
