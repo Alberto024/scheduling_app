@@ -28,6 +28,29 @@ import plotly.express as px
 
 
 @dataclass
+class Lab:
+    index: int
+    name: str
+    alias: Optional[str] = None
+
+
+@dataclass
+class Location:
+    x: int
+    y: int
+
+
+@dataclass
+class Bench:
+    index: int
+    full_name: str  # 4550-32
+    name: str  # 32
+    lab: Lab  # SB1, SB2, SB3
+    location: Location
+    active_shift: str  # AM, PM
+
+
+@dataclass
 class Shift:
     index: int
     label: str  # 'AM', 'PM', or 'FULL'
@@ -49,13 +72,29 @@ class Employee:
     id: str
     max_slots: int
     preferences: Dict[int, int]
+    home_bench: Optional[Bench] = None
 
 
 @dataclass
-class ScheduleParameters:
+class ConstraintParameters:
     max_unfairness: int = -1
     fairness_weight: int = 0
     fill_schedule_weight: int = 1
+    include_location_optimization: bool = False
+
+
+@dataclass
+class MapParameters:
+    labs: str
+
+
+@dataclass
+class Constraints:
+    raw_slot_constraints: pd.DataFrame
+    slot_constraints: pd.DataFrame
+    raw_bench_constraints: Optional[pd.DataFrame] = None
+    raw_lab_separation: Optional[pd.DataFrame] = None
+    raw_lab_maps: Optional[Dict[str, pd.DataFrame]] = None
 
 
 @dataclass
@@ -69,7 +108,18 @@ class Schedule:
     max_employee_score: int
     total_possible_shifts: int
     total_shifts_filled: int
-    employee_schedule: Dict[int, List[Shift]]
+    employee_schedule: Dict[int, List[Shift]]  # {Employee.id: [Shifts]}
+    shift_schedule: Dict[int, List[Employee]]  # {Shift.id: [Employees]}
+    shift_bench_schedule: Optional[
+        Dict[int, Dict[int, Bench]]
+    ] = None  # {Shift.id: {Employee.id: Bench}}
+    employee_bench_schedule: Optional[
+        Dict[int, Dict[int, Bench]]
+    ] = None  # {Employee.id: {Shift.id: Bench}}
+    bench_objective_score: Optional[int] = None
+    bench_optimization_average_distance: Optional[
+        Dict[int, float]
+    ] = None  # {Employee.id: average distance}
     pretty_employee_schedule: Optional[pd.DataFrame] = pd.DataFrame()
 
 
@@ -103,16 +153,62 @@ PREFERENCE_TO_SCORE: Dict[int, int] = {
 # =======================================================================#
 
 
-@st.cache
-def read_schedule(schedule_csv: str) -> pd.DataFrame:
-    df: pd.DataFrame = (
-        pd.read_csv(schedule_csv)
-        .melt(id_vars=["Shift"])
-        .rename(
-            columns={"variable": "day", "value": "slots", "Shift": "shift"}
-        )
+def read_constraints(
+    constraints_xlsx: str, parameters: ConstraintParameters
+) -> Constraints:
+    constraints_file: pd.ExcelFile = pd.ExcelFile(constraints_xlsx)
+    raw_slot_constraints = constraints_file.parse(
+        sheet_name="slot_constraints",
+        header=0,
+        index_col=None,
     )
-    df = df.loc[df["slots"] != 0, :].reset_index(drop=True).reset_index()
+    slot_constraints = prepare_schedule(
+        raw_slot_constraints=raw_slot_constraints
+    )
+
+    constraints: Constraints
+    if parameters.include_location_optimization:
+        raw_bench_constraints = constraints_file.parse(
+            sheet_name="bench_constraints",
+            header=0,
+            index_col=None,
+        )
+        raw_bench_constraints["benches"] = raw_bench_constraints[
+            "benches"
+        ].apply(lambda value: value.split(","))
+        raw_lab_separation = constraints_file.parse(
+            sheet_name="lab_separation",
+            header=0,
+            index_col=0,
+        )
+
+        raw_lab_maps: Dict[str, pd.DataFrame] = {}
+        for lab in raw_lab_separation.index:
+            raw_lab_maps[lab] = constraints_file.parse(
+                sheet_name=str(lab), header=None, index_col=None, dtype=str
+            ).fillna("")
+
+        constraints = Constraints(
+            raw_slot_constraints=raw_slot_constraints,
+            slot_constraints=slot_constraints,
+            raw_bench_constraints=raw_bench_constraints,
+            raw_lab_separation=raw_lab_separation,
+            raw_lab_maps=raw_lab_maps,
+        )
+    else:
+        constraints = Constraints(
+            raw_slot_constraints=raw_slot_constraints,
+            slot_constraints=slot_constraints,
+        )
+    return constraints
+
+
+def prepare_schedule(raw_slot_constraints: pd.DataFrame) -> pd.DataFrame:
+    df: pd.DataFrame = raw_slot_constraints.melt(id_vars=["Shift"]).rename(
+        columns={"variable": "day", "value": "slots", "Shift": "shift"}
+    )
+    # df = df.loc[df["slots"] != 0, :].reset_index(drop=True).reset_index()
+    df = df.reset_index(drop=True).reset_index()
     return df
 
 
@@ -173,30 +269,119 @@ def prepare_preferences(
     return employee_preferences
 
 
+def create_lab(obj_in: pd.Series, db: Dict[str, Lab]) -> Dict[str, Lab]:
+    existing_labs = db.keys()
+    if obj_in["lab"] not in db:
+        db[obj_in["lab"]] = Lab(
+            index=len(existing_labs),
+            name=obj_in["lab"],
+            alias=obj_in["alias"],
+        )
+    return db
+
+
+def find_active_shift(
+    constraints: Constraints, lab: Lab, bench_name: str
+) -> str:
+    assert constraints.raw_bench_constraints is not None
+    active_shift: str
+    if bench_name:
+        tmp_shift_var: pd.Series = constraints.raw_bench_constraints.loc[
+            (constraints.raw_bench_constraints["lab"] == lab.name)
+            & (
+                constraints.raw_bench_constraints["benches"].apply(
+                    lambda active_benches: bench_name in active_benches
+                )
+            ),
+            "shift",
+        ]
+        active_shift = (
+            "" if tmp_shift_var.empty else tmp_shift_var.values[0]
+        )
+    else:
+        active_shift = ""
+    return active_shift
+
+
+def create_bench(
+    name: str,
+    lab: Lab,
+    location: Location,
+    active_shift: str,
+    db: Dict[str, Bench],
+) -> None:
+    if name:
+        existing_benches = db.keys()
+        bench_name = f"{lab.name}-{name}"
+        if bench_name not in db:
+            db[bench_name] = Bench(
+                index=len(existing_benches),
+                full_name=bench_name,
+                name=name,
+                location=location,
+                lab=lab,
+                active_shift=active_shift,
+            )
+    else:
+        pass
+    return None
+
+
 def prettify_schedule(
     schedule: Schedule,
     all_employees: Dict[int, Employee],
     all_shifts: Dict[int, Shift],
     all_days: Dict[str, Day],
 ) -> pd.DataFrame:
-    nice_schedule: pd.DataFrame = pd.DataFrame(
-        {day: [] for day in all_days}.update(
-            {"score": [], "number_of_shifts": [], "max_desired_shifts": []}
+    nice_schedule: pd.DataFrame
+    if schedule.shift_bench_schedule:
+        nice_schedule = pd.DataFrame(
+            {day: [] for day in all_days}.update(
+                {
+                    "score": [],
+                    "number_of_shifts": [],
+                    "max_desired_shifts": [],
+                    "home_bench": [],
+                }
+            )
         )
-    )
+    else:
+        nice_schedule = pd.DataFrame(
+            {day: [] for day in all_days}.update(
+                {
+                    "score": [],
+                    "number_of_shifts": [],
+                    "max_desired_shifts": [],
+                }
+            )
+        )
     for employee in all_employees:
         employee_row = {}
         for shift in schedule.employee_schedule[employee]:
-            if shift.day in employee_row:
-                employee_row[shift.day] = (
-                    f"AM+PM "
-                    f"({all_employees[employee].preferences[shift.index]})"
-                )
+            if schedule.shift_bench_schedule:
+                if shift.day in employee_row:
+                    employee_row[shift.day] = (
+                        f"AM+PM "
+                        f"[{schedule.shift_bench_schedule[shift.index][employee].full_name}]"
+                        f"({all_employees[employee].preferences[shift.index]})"
+                    )
+                else:
+                    employee_row[shift.day] = (
+                        f"{shift.label} "
+                        f"[{schedule.shift_bench_schedule[shift.index][employee].full_name}]"
+                        f"({all_employees[employee].preferences[shift.index]})"
+                    )
             else:
-                employee_row[shift.day] = (
-                    f"{shift.label} "
-                    f"({all_employees[employee].preferences[shift.index]})"
-                )
+                if shift.day in employee_row:
+                    employee_row[shift.day] = (
+                        f"AM+PM "
+                        f"({all_employees[employee].preferences[shift.index]})"
+                    )
+                else:
+                    employee_row[shift.day] = (
+                        f"{shift.label} "
+                        f"({all_employees[employee].preferences[shift.index]})"
+                    )
         for day in all_days:
             if day not in employee_row:
                 employee_row[day] = ""
@@ -207,6 +392,10 @@ def prettify_schedule(
         employee_row["max_desired_shifts"] = str(
             all_employees[employee].max_slots
         )
+        if schedule.shift_bench_schedule:
+            employee_row["home_bench"] = all_employees[
+                employee
+            ].home_bench.full_name
         nice_schedule = nice_schedule.append(
             pd.Series(
                 employee_row,
@@ -232,20 +421,39 @@ def prettify_schedule(
             pd.Series(TOTAL_ROW, name="TOTAL Daily Swipes/Day"),
         ]
     )
-    nice_schedule = nice_schedule.loc[
-        :,
-        [
-            "Monday",
-            "Tuesday",
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-            "number_of_shifts",
-            "max_desired_shifts",
-            "score",
-        ],
-    ]
+    if schedule.shift_bench_schedule:
+        nice_schedule = nice_schedule.loc[
+            :,
+            [
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+                "number_of_shifts",
+                "max_desired_shifts",
+                "score",
+                "home_bench",
+            ],
+        ]
+    else:
+        nice_schedule = nice_schedule.loc[
+            :,
+            [
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+                "number_of_shifts",
+                "max_desired_shifts",
+                "score",
+            ],
+        ]
     return nice_schedule
 
 
@@ -266,6 +474,30 @@ def get_table_download_link(
     ).decode()  # some strings <-> bytes conversions necessary here
     href = (
         f'<a href="data:file/csv;base64,{b64}" '
+        f'download="{output_filename}">{label}</a>'
+    )
+    return href
+
+
+def get_excel_download_link(
+    excel_file: str, label: str, output_filename: str
+) -> str:
+    """Generates a link allowing the data in a given excel file to be
+    downloaded
+    in:  excel filepath
+    out: href string
+
+    From:
+    https://discuss.streamlit.io/t/how-to-download-file-in-streamlit/1806
+    """
+    excel_contents: bytes
+    with open(excel_file, "rb") as F:
+        excel_contents = F.read()
+    b64 = base64.b64encode(
+        excel_contents
+    ).decode()  # some strings <-> bytes conversions necessary here
+    href = (
+        f'<a href="data:file/xlsx;base64,{b64}" '
         f'download="{output_filename}">{label}</a>'
     )
     return href
@@ -339,7 +571,7 @@ def create_demand_heatmap(roster: pd.DataFrame) -> go.Figure:
             y=roster_formatted_for_heatmap.index,
         ),
         layout=go.Layout(
-            title="<b>Average Shift Demand (lower = more demand)</b>",
+            title="<b>Average Shift Preference (lower = more demand)</b>",
             # paper_bgcolor="rgb(248, 248, 255)",
             # plot_bgcolor="rgb(248, 248, 255)",
         ),
@@ -368,9 +600,8 @@ def compute_optimal_schedule(
     all_employees: Dict[int, Employee],
     all_shifts: Dict[int, Shift],
     all_days: Dict[str, Day],
-    schedule_parameters: ScheduleParameters,
+    schedule_parameters: ConstraintParameters,
 ) -> Schedule:
-    # Returns shift id -> list of employees working
     model = CpModel()
 
     shifts = {}
@@ -457,8 +688,44 @@ def compute_optimal_schedule(
     # Maximize points from requests
     # Maximize number of shifts filled
     # Minimize variance of scores per employee
+    weights: Dict[str, int] = {
+        "preferences": int(
+            10
+            * (
+                1
+                / (
+                    1
+                    + schedule_parameters.fill_schedule_weight
+                    + schedule_parameters.fairness_weight
+                )
+            )
+        ),
+        "fill_schedule": int(
+            10
+            * (
+                schedule_parameters.fill_schedule_weight
+                / (
+                    1
+                    + schedule_parameters.fill_schedule_weight
+                    + schedule_parameters.fairness_weight
+                )
+            )
+        ),
+        "fairness": int(
+            10
+            * (
+                schedule_parameters.fairness_weight
+                / (
+                    1
+                    + schedule_parameters.fill_schedule_weight
+                    + schedule_parameters.fairness_weight
+                )
+            )
+        ),
+    }
     model.Maximize(
-        sum(
+        weights["preferences"]
+        * sum(
             all_employees[employee].preferences[shift]
             * shifts[(employee, shift)]
             if all_shifts[shift].label != "FULL"
@@ -468,20 +735,20 @@ def compute_optimal_schedule(
             for employee in all_employees
             for shift in all_shifts
         )
-        + schedule_parameters.fill_schedule_weight
+        + weights["fill_schedule"]
         * sum(
             shifts[(employee, shift)]
             for employee in all_employees
             for shift in all_shifts
         )
-        - schedule_parameters.fairness_weight
-        * (max_employee_score - min_employee_score)
+        - weights["fairness"] * (max_employee_score - min_employee_score)
     )
 
+    st.write("Constraints set up. Running Optimization...")
     solver = CpSolver()
+    solver.parameters.max_time_in_seconds = 60
     solver.Solve(model)
-    st.write(solver.StatusName())
-    st.write(solver.ResponseStats())
+    st.write("Finished Schedule Optimization!")
 
     # Prepare results
     shifts_per_employee: Dict[int, int] = {
@@ -522,6 +789,14 @@ def compute_optimal_schedule(
         ]
         for employee in all_employees
     }
+    shift_schedule: Dict[int, List[Employee]] = {
+        shift: [
+            all_employees[employee]
+            for employee in all_employees
+            if solver.Value(shifts[(employee, shift)])
+        ]
+        for shift in all_shifts
+    }
 
     schedule: Schedule = Schedule(
         objective_score=solver.ObjectiveValue(),
@@ -534,17 +809,180 @@ def compute_optimal_schedule(
         total_possible_shifts=total_possible_shifts,
         total_shifts_filled=sum(shifts_per_employee.values()),
         employee_schedule=employee_schedule,
+        shift_schedule=shift_schedule,
     )
     return schedule
 
 
+def compute_optimal_bench_map(
+    schedule: Schedule,
+    all_employees: Dict[int, Employee],
+    all_shifts: Dict[int, Shift],
+    all_labs: Dict[str, Lab],
+    all_benches: Dict[str, Bench],
+    constraints: Constraints,
+) -> Schedule:
+    # Make sure employees have home_bench information
+    for employee in all_employees:
+        assert all_employees[employee].home_bench is not None
+
+    model = CpModel()
+
+    bench_placement = {}
+    for shift in schedule.shift_schedule:
+        for employee in schedule.shift_schedule[shift]:
+            for bench in all_benches:
+                bench_placement[
+                    (shift, employee.index, bench)
+                ] = model.NewBoolVar(
+                    f"bench_s{shift}e{employee.index}b{bench}"
+                )
+
+    # 2 employees cannot have same bench
+    for shift in schedule.shift_schedule:
+        for bench in all_benches:
+            model.Add(
+                sum(
+                    bench_placement[(shift, employee.index, bench)]
+                    for employee in schedule.shift_schedule[shift]
+                )
+                <= 1
+            )
+
+    # All employees scheduled must have a bench for each shift
+    # Other employees must not have a bench
+    for shift in schedule.shift_schedule:
+        for employee in schedule.shift_schedule[shift]:
+            model.Add(
+                sum(
+                    bench_placement[(shift, employee.index, bench)]
+                    for bench in all_benches
+                )
+                == 1
+            )
+
+    # Make sure appropriate benches are utilized during appropriate shift
+    for shift in schedule.shift_schedule:
+        for bench in all_benches:
+            if (all_shifts[shift].label == "FULL") and (
+                all_benches[bench].active_shift == "AM"
+            ):
+                # This works because we want FULL shifts to use AM benches
+                # If proper condition, no constraint will be added
+                # If anything else, it will be added
+                # For example, FULL + PM will have constraint == 0
+                pass  # important
+            elif (
+                all_shifts[shift].label != all_benches[bench].active_shift
+            ):
+                model.Add(
+                    sum(
+                        bench_placement[(shift, employee.index, bench)]
+                        for employee in schedule.shift_schedule[shift]
+                    )
+                    == 0
+                )
+
+    # Create objective
+    # Minimize distance from home bench to placed bench
+    model.Minimize(
+        sum(
+            (
+                (
+                    employee.home_bench.location.x  # type: ignore
+                    - all_benches[bench].location.x
+                )
+                ** 2
+                + (
+                    employee.home_bench.location.y  # type: ignore
+                    - all_benches[bench].location.y
+                )
+                ** 2
+                + (
+                    constraints.raw_lab_separation.loc[  # type: ignore
+                        employee.home_bench.lab.name,  # type: ignore
+                        all_benches[bench].lab.name,
+                    ]
+                )
+            )
+            * bench_placement[(shift, employee.index, bench)]
+            for shift in schedule.shift_schedule
+            for employee in schedule.shift_schedule[shift]
+            for bench in all_benches
+        )
+    )
+
+    st.write("Running Location Optimization...")
+    solver = CpSolver()
+    solver.parameters.max_time_in_seconds = 60
+    solver.Solve(model)
+    st.write("Finished Location Optimization!")
+
+    shift_bench_schedule: Dict[
+        int, Dict[int, Bench]
+    ] = {}  # {Shift.id: {Employee.id: Bench}}
+    shift_bench_schedule = {
+        shift: {
+            employee.index: all_benches[bench]
+            for employee in schedule.shift_schedule[shift]
+            for bench in all_benches
+            if solver.Value(
+                bench_placement[(shift, employee.index, bench)]
+            )
+        }
+        for shift in all_shifts
+    }
+    employee_bench_schedule: Dict[
+        int, Dict[int, Bench]
+    ] = {}  # {Employee.id: {Shift.id: Bench}}
+    for shift in shift_bench_schedule:
+        for employee in shift_bench_schedule[shift]:
+            employee_bench_schedule[employee] = {}
+    for shift in shift_bench_schedule:
+        for employee in shift_bench_schedule[shift]:
+            employee_bench_schedule[employee][
+                shift
+            ] = shift_bench_schedule[shift][employee]
+
+    employee_bench_distances: Dict[
+        int, float
+    ] = {}  # {Employee.id: average distance}
+    for employee in employee_bench_schedule:
+        employee_bench_distances[employee] = statistics.mean(
+            [
+                (
+                    (
+                        employee_bench_schedule[employee][shift].location.x
+                        - all_employees[employee].home_bench.location.x
+                    )
+                    ** 2
+                    + (
+                        employee_bench_schedule[employee][shift].location.y
+                        - all_employees[employee].home_bench.location.y
+                    )
+                    ** 2
+                )
+                ** 0.5
+                for shift in employee_bench_schedule[employee]
+            ]
+        )
+
+    schedule.shift_bench_schedule = shift_bench_schedule
+    schedule.employee_bench_schedule = employee_bench_schedule
+    schedule.bench_objective_score = solver.ObjectiveValue()
+    schedule.bench_optimization_average_distance = employee_bench_distances
+    return schedule
+
+
 def create_optimal_schedule(
-    schedule: pd.DataFrame,
+    constraints: Constraints,
     roster: pd.DataFrame,
-    parameters: ScheduleParameters,
-):
+    parameters: ConstraintParameters,
+) -> Schedule:
     days: Dict[str, Day] = {}
-    schedule.apply(lambda row: create_day(obj_in=row, db=days), axis=1)
+    constraints.slot_constraints.apply(
+        lambda row: create_day(obj_in=row, db=days), axis=1
+    )
 
     employees: Dict[int, Employee] = {}
     roster.apply(
@@ -563,6 +1001,52 @@ def create_optimal_schedule(
         all_days=days,
         schedule_parameters=parameters,
     )
+
+    if parameters.include_location_optimization:
+        assert constraints.raw_bench_constraints is not None
+        assert constraints.raw_lab_maps is not None
+        # Create labs
+        labs: Dict[str, Lab] = {}
+        constraints.raw_bench_constraints.apply(
+            lambda row: create_lab(obj_in=row, db=labs), axis=1
+        )
+
+        # Create benches
+        benches: Dict[str, Bench] = {}
+        for lab in constraints.raw_lab_maps:
+            constraints.raw_lab_maps[lab].apply(
+                lambda row: pd.DataFrame(row).apply(
+                    lambda col: create_bench(
+                        name=col.values[0],
+                        lab=labs[lab],
+                        location=Location(x=row.name, y=col.name),
+                        db=benches,
+                        active_shift=find_active_shift(
+                            constraints=constraints,
+                            lab=labs[lab],
+                            bench_name=col.values[0],
+                        ),
+                    ),
+                    axis=1,
+                ),
+                axis=1,
+            )
+
+        # Update Employee Home Benches
+        for employee in employees:
+            bench_name: str = roster.loc[
+                roster["id"] == employees[employee].id, "home_bench"
+            ].values[0]
+            employees[employee].home_bench = benches[bench_name]
+
+        optimal_schedule = compute_optimal_bench_map(
+            schedule=optimal_schedule,
+            all_employees=employees,
+            all_shifts=shifts,
+            all_labs=labs,
+            all_benches=benches,
+            constraints=constraints,
+        )
 
     optimal_schedule.pretty_employee_schedule = prettify_schedule(
         schedule=optimal_schedule,
@@ -586,6 +1070,9 @@ def app():
     )
 
     st.sidebar.header("Optimization Settings")
+    include_location_optimization = st.sidebar.checkbox(
+        label="Include location optimization", value=True
+    )
     fairness_weight = st.sidebar.slider(
         label="Fairness Weight", min_value=0, max_value=50, value=0, step=1
     )
@@ -603,33 +1090,39 @@ def app():
         value=-1,
         step=1,
     )
-    parameters: ScheduleParameters = ScheduleParameters(
+    parameters: ConstraintParameters = ConstraintParameters(
         max_unfairness=max_unfairness,
         fairness_weight=fairness_weight,
         fill_schedule_weight=fill_schedule_weight,
+        include_location_optimization=include_location_optimization,
     )
 
     st.title("Scheduling App")
     st.subheader("Optimized using Google OR-Tools in Python")
 
-    schedule: pd.DataFrame = pd.DataFrame()
+    constraints: Constraints = Constraints(
+        raw_slot_constraints=pd.DataFrame(),
+        slot_constraints=pd.DataFrame(),
+    )
     roster: pd.DataFrame = pd.DataFrame()
 
     if page == "Play with demo":
-        schedule = read_schedule("demo_schedule_constraints.csv")
+        constraints = read_constraints(
+            constraints_xlsx="demo_constraints.xlsx",
+            parameters=parameters,
+        )
         roster = read_roster("demo_roster.csv")
     else:
         st.markdown(
-            get_table_download_link(
-                df=pd.read_csv("demo_schedule_constraints.csv"),
-                label="Download Example Schedule Constraints",
-                output_filename="demo_schedule_constraints.csv",
-                index=False,
+            get_excel_download_link(
+                excel_file="demo_constraints.xlsx",
+                label="Download Example Constraints",
+                output_filename="demo_constraints.xlsx",
             ),
             unsafe_allow_html=True,
         )
-        schedule_file = st.file_uploader(
-            label="Schedule Constraints File Upload", type="csv"
+        constraints_file = st.file_uploader(
+            label="Constraints File Upload", type="xlsx"
         )
         st.markdown(
             get_table_download_link(
@@ -643,32 +1136,60 @@ def app():
         roster_file = st.file_uploader(
             label="Roster File Upload", type="csv"
         )
-        if schedule_file is not None:
-            schedule_file.seek(0)
-            schedule = read_schedule(schedule_file)
+        if constraints_file is not None:
+            constraints_file.seek(0)
+            constraints = read_constraints(
+                constraints_xlsx=constraints_file,
+                parameters=parameters,
+            )
         if roster_file is not None:
             roster_file.seek(0)
             roster = read_roster(roster_file)
 
-    if not schedule.empty and not roster.empty:
+    if not constraints.slot_constraints.empty and not roster.empty:
         optimal_schedule: Schedule = create_optimal_schedule(
-            schedule=schedule, roster=roster, parameters=parameters
+            constraints=constraints,
+            roster=roster,
+            parameters=parameters,
         )
         st.header("Schedule Constraints")
-        st.write(schedule)
+        st.write(constraints.raw_slot_constraints)
 
         st.header("Roster")
         st.write(roster)
+
+        if parameters.include_location_optimization:
+            st.header("Bench Constraints")
+            st.write(constraints.raw_bench_constraints)
+            st.header("Lab Separation")
+            st.write(constraints.raw_lab_separation)
+            for lab in constraints.raw_lab_maps:
+                st.header(f"{lab}")
+                st.write(constraints.raw_lab_maps[lab])
 
         demand_heatmap = create_demand_heatmap(roster=roster)
         st.plotly_chart(demand_heatmap)
 
         st.header("Optimal Schedule")
-        st.write(f"Objective Score: {optimal_schedule.objective_score}")
+        st.write(
+            f"Shift Optimization Score: {optimal_schedule.objective_score}"
+        )
         st.write(
             f"Shifts Filled: {optimal_schedule.total_shifts_filled} "
             f"out of {optimal_schedule.total_possible_shifts}"
         )
+        if parameters.include_location_optimization:
+            st.write(
+                f"Bench Optimization Score"
+                f": {optimal_schedule.bench_objective_score}"
+            )
+            average_bench_distance: float = statistics.mean(
+                optimal_schedule.bench_optimization_average_distance.values()
+            )
+            st.write(
+                f"Average Distance b/w home bench and shift bench: "
+                f"{average_bench_distance}"
+            )
         st.write(optimal_schedule.pretty_employee_schedule)
         st.markdown(
             get_table_download_link(
