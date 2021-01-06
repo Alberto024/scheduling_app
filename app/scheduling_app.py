@@ -153,6 +153,7 @@ PREFERENCE_TO_SCORE: Dict[int, int] = {
 # =======================================================================#
 
 
+@st.cache
 def read_constraints(
     constraints_xlsx: str, parameters: ConstraintParameters
 ) -> Constraints:
